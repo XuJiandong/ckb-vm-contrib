@@ -1,0 +1,18 @@
+[package]
+name = "ckb-opt-blake2b"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Optimized BLAKE2b implementation for CKB-VM with Rust bindings"
+repository = "https://github.com/nervosnetwork/ckb-vm-contrib"
+keywords = ["blake2b", "ckb", "risc-v", "cryptography"]
+categories = ["cryptography", "no-std"]
+
+[workspace]
+
+[lib]
+name = "ckb_opt_blake2b"
+
+[build-dependencies]
+cc = "1.0"
+clang-finder = "0.1"
