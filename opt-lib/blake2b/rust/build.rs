@@ -4,9 +4,11 @@ fn main() {
     let target = env::var("TARGET").unwrap();
 
     let mut builder = cc::Build::new();
-    builder.compiler(clang_finder::find());
+    if !target.contains("zkvm") {
+        builder.compiler(clang_finder::find());
+    }
     builder.file("src/blake2b.c").include("src").opt_level(3);
-    if target.contains("riscv64") {
+    if target.contains("riscv64") && !target.contains("zkvm") {
         builder.flag("-march=rv64imc_zba_zbb_zbc_zbs");
     }
     builder.compile("blake2b");
