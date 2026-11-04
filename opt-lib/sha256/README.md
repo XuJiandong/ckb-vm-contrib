@@ -5,6 +5,7 @@ This folder contains an optimized implementation of SHA-256 for CKB-VM.
 ## Optimizations
 
 - **Loop Unrolling**: Uses `#pragma GCC unroll` to improve throughput.
+- **MOP Fusion**: Groups three-term additions into the ADC pattern from VM RFC 0033 and keeps round constant loads fusible. RISC-V uses small inline assembly helpers; other targets use C arithmetic.
 - **RISC-V B Extension**: Uses `rev8` (via `__builtin_bswap64`) for efficient byte swapping.
 - **64-bit State Loading**: Loads the internal state using 64-bit operations to reduce instructions.
 - **LTO**: Makefile enables Link Time Optimization (`-flto`).
@@ -31,4 +32,11 @@ make
 
 ```sh
 make run
+```
+
+Run the separate C regression tests for padding boundaries, fragmented updates,
+and unaligned input/output buffers:
+
+```sh
+make check
 ```

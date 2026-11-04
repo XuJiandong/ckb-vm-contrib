@@ -5,6 +5,8 @@ LD = ld.lld-$(CLANG_VERSION)
 LLVM_OBJDUMP = llvm-objdump-$(CLANG_VERSION)
 LLVM_STRIP = llvm-strip-$(CLANG_VERSION)
 
+.PHONY: all run check asm fmt clean
+
 # -flto enables Link Time Optimization for better cross-module optimization (~4% cycle reduction)
 # May increase compile time and can occasionally cause issues with specific toolchain configurations
 
@@ -27,11 +29,24 @@ all: main.o sha256.o
 run:
 	ckb-debugger --bin main
 
+main.o sha256.o test_sha256.o: sha256.h
+
+test_sha256.o: test/test_sha256.c
+	$(CLANG) $(CFLAGS) -c -o $@ $<
+
+target/test_sha256: test_sha256.o sha256.o
+	mkdir -p target
+	$(LD) $(LDFLAGS) -o $@ $^
+	$(LLVM_STRIP) -s $@
+
+check: target/test_sha256
+	ckb-debugger --bin $<
+
 asm: sha256.o
 	$(LLVM_OBJDUMP) -d -S sha256.o
 
 fmt:
-	$(CLANG_FORMAT) --style="{BasedOnStyle: Google, IndentWidth: 4}" -i *.c *.h
+	$(CLANG_FORMAT) --style="{BasedOnStyle: Google, IndentWidth: 4}" -i *.c *.h test/*.c
 
 clean:
-	rm -f main.o sha256.o main
+	rm -f main.o sha256.o test_sha256.o main target/test_sha256

@@ -1,11 +1,14 @@
 /*************************** HEADER FILES ***************************/
 #include "sha256.h"
 
+// Permit paired word loads without violating the state array's effective type.
+typedef SHA256_DWORD SHA256_ALIAS __attribute__((__may_alias__));
+
 /****************************** MACROS ******************************/
 #define ROTRIGHT(a, b) (((a) >> (b)) | ((a) << (32 - (b))))
 
 #define CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
-#define MAJ(x, y, z) ((((x) | (y)) & (z)) | ((x) & (y)))
+#define MAJ(x, y, z) ((y) ^ (((x) ^ (y)) & ((y) ^ (z))))
 #define EP0(x) (ROTRIGHT(x, 2) ^ ROTRIGHT(x, 13) ^ ROTRIGHT(x, 22))
 #define EP1(x) (ROTRIGHT(x, 6) ^ ROTRIGHT(x, 11) ^ ROTRIGHT(x, 25))
 #define SIG0(x) (ROTRIGHT(x, 7) ^ ROTRIGHT(x, 18) ^ ((x) >> 3))
@@ -26,18 +29,51 @@ static const SHA256_WORD GLOBAL_K[64] = {
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
 
 /*********************** FUNCTION DEFINITIONS ***********************/
-#define SHA256_ROUND(a, b, c, d, e, f, g, h, ki, mi)               \
-    do {                                                           \
-        SHA256_WORD t1 = (h) + EP1(e) + CH(e, f, g) + (ki) + (mi); \
-        SHA256_WORD t2 = EP0(a) + MAJ(a, b, c);                    \
-        (d) += t1;                                                 \
-        (h) = t1 + t2;                                             \
+// RFC 0033: CKB-VM fuses this exact add/sltu/add/sltu/or sequence into
+// one ADC (one cycle). Only the low 32 bits of the three-term sum are needed;
+// the carry outputs are discarded. Early-clobber constraints keep all three
+// registers distinct, as required by the VM's pattern matcher. Keep the whole
+// sequence in one asm block so the compiler cannot reorder or remove it.
+static inline __attribute__((always_inline)) SHA256_WORD
+sha256_add3(SHA256_WORD a, SHA256_WORD b, SHA256_WORD c) {
+#if defined(__riscv) && __riscv_xlen == 64
+    __asm__(
+        "add %0, %0, %1\n\t"
+        "sltu %1, %0, %1\n\t"
+        "add %0, %0, %2\n\t"
+        "sltu %2, %0, %2\n\t"
+        "or %1, %1, %2"
+        : "+&r"(a), "+&r"(b), "+&r"(c));
+    return a;
+#else
+    return a + b + c;
+#endif
+}
+
+// Keep round constants in word registers so LLVM emits adjacent lui/addiw
+// instructions, which CKB-VM can fuse into a single constant load (RFC 0033).
+static inline SHA256_WORD sha256_round_constant(SHA256_WORD k) {
+#if defined(__riscv) && __riscv_xlen == 64
+    __asm__("" : "+r"(k));
+#endif
+    return k;
+}
+
+#define SHA256_ROUND(a, b, c, d, e, f, g, h, mi, ki)                     \
+    do {                                                                 \
+        SHA256_WORD k = sha256_round_constant(ki);                       \
+        SHA256_WORD t1 =                                                 \
+            sha256_add3(sha256_add3((h), EP1(e), CH(e, f, g)), (mi), k); \
+        (d) += t1;                                                       \
+        (h) = sha256_add3(t1, EP0(a), MAJ(a, b, c));                     \
     } while (0)
 
+// Blocks are copied into ctx->data before compression, providing the alignment
+// needed for the 64-bit loads even when callers supply unaligned byte buffers.
 void sha256_transform(SHA256_CTX *ctx, const SHA256_BYTE data[]) {
     SHA256_WORD a, b, c, d, e, f, g, h;
     SHA256_WORD m[64];
-    const SHA256_DWORD *data64 = (const SHA256_DWORD *)data;
+    const SHA256_ALIAS *data64 = (const SHA256_ALIAS *)data;
 
 #pragma GCC unroll 8
     for (int i = 0; i < 8; ++i) {
@@ -47,7 +83,7 @@ void sha256_transform(SHA256_CTX *ctx, const SHA256_BYTE data[]) {
     }
 
     // Load state using 64-bit operations
-    const SHA256_DWORD *state64 = (const SHA256_DWORD *)ctx->state;
+    const SHA256_ALIAS *state64 = (const SHA256_ALIAS *)ctx->state;
     SHA256_DWORD s01 = state64[0];
     SHA256_DWORD s23 = state64[1];
     SHA256_DWORD s45 = state64[2];
@@ -75,21 +111,28 @@ void sha256_transform(SHA256_CTX *ctx, const SHA256_BYTE data[]) {
 
 #pragma GCC unroll 6
     for (int i = 16; i < 64; i += 8) {
-        m[i] = SIG1(m[i - 2]) + m[i - 7] + SIG0(m[i - 15]) + m[i - 16];
+        m[i] =
+            sha256_add3(m[i - 16], SIG1(m[i - 2]), SIG0(m[i - 15])) + m[i - 7];
         SHA256_ROUND(a, b, c, d, e, f, g, h, m[i], GLOBAL_K[i]);
-        m[i + 1] = SIG1(m[i - 1]) + m[i - 6] + SIG0(m[i - 14]) + m[i - 15];
+        m[i + 1] =
+            sha256_add3(m[i - 15], SIG1(m[i - 1]), SIG0(m[i - 14])) + m[i - 6];
         SHA256_ROUND(h, a, b, c, d, e, f, g, m[i + 1], GLOBAL_K[i + 1]);
-        m[i + 2] = SIG1(m[i]) + m[i - 5] + SIG0(m[i - 13]) + m[i - 14];
+        m[i + 2] =
+            sha256_add3(m[i - 14], SIG1(m[i]), SIG0(m[i - 13])) + m[i - 5];
         SHA256_ROUND(g, h, a, b, c, d, e, f, m[i + 2], GLOBAL_K[i + 2]);
-        m[i + 3] = SIG1(m[i + 1]) + m[i - 4] + SIG0(m[i - 12]) + m[i - 13];
+        m[i + 3] =
+            sha256_add3(m[i - 13], SIG1(m[i + 1]), SIG0(m[i - 12])) + m[i - 4];
         SHA256_ROUND(f, g, h, a, b, c, d, e, m[i + 3], GLOBAL_K[i + 3]);
-        m[i + 4] = SIG1(m[i + 2]) + m[i - 3] + SIG0(m[i - 11]) + m[i - 12];
+        m[i + 4] =
+            sha256_add3(m[i - 12], SIG1(m[i + 2]), SIG0(m[i - 11])) + m[i - 3];
         SHA256_ROUND(e, f, g, h, a, b, c, d, m[i + 4], GLOBAL_K[i + 4]);
-        m[i + 5] = SIG1(m[i + 3]) + m[i - 2] + SIG0(m[i - 10]) + m[i - 11];
+        m[i + 5] =
+            sha256_add3(m[i - 11], SIG1(m[i + 3]), SIG0(m[i - 10])) + m[i - 2];
         SHA256_ROUND(d, e, f, g, h, a, b, c, m[i + 5], GLOBAL_K[i + 5]);
-        m[i + 6] = SIG1(m[i + 4]) + m[i - 1] + SIG0(m[i - 9]) + m[i - 10];
+        m[i + 6] =
+            sha256_add3(m[i - 10], SIG1(m[i + 4]), SIG0(m[i - 9])) + m[i - 1];
         SHA256_ROUND(c, d, e, f, g, h, a, b, m[i + 6], GLOBAL_K[i + 6]);
-        m[i + 7] = SIG1(m[i + 5]) + m[i] + SIG0(m[i - 8]) + m[i - 9];
+        m[i + 7] = sha256_add3(m[i - 9], SIG1(m[i + 5]), SIG0(m[i - 8])) + m[i];
         SHA256_ROUND(b, c, d, e, f, g, h, a, m[i + 7], GLOBAL_K[i + 7]);
     }
 
@@ -114,19 +157,35 @@ void sha256_init(SHA256_CTX *ctx) {
 
 void sha256_update(SHA256_CTX *ctx, const SHA256_BYTE data[],
                    SHA256_DWORD len) {
-    SHA256_WORD i = 0;
-
-    while (i < len) {
-        SHA256_DWORD space = 64 - ctx->datalen;
-        SHA256_DWORD to_copy = (space < len - i) ? space : len - i;
-        __builtin_memcpy(&ctx->data[ctx->datalen], &data[i], to_copy);
-        ctx->datalen += to_copy;
-        i += to_copy;
-        if (ctx->datalen == 64) {
-            sha256_transform(ctx, ctx->data);
-            ctx->bitlen += 512;
-            ctx->datalen = 0;
+    if (len == 0) {
+        return;
+    }
+    // Complete a buffered block first, then copy whole blocks and the tail.
+    if (ctx->datalen != 0) {
+        SHA256_WORD space = 64 - ctx->datalen;
+        if (len < space) {
+            __builtin_memcpy(ctx->data + ctx->datalen, data, len);
+            ctx->datalen += len;
+            return;
         }
+        __builtin_memcpy(ctx->data + ctx->datalen, data, space);
+        sha256_transform(ctx, ctx->data);
+        ctx->bitlen += 512;
+        data += space;
+        len -= space;
+        ctx->datalen = 0;
+    }
+    // Use a 64-bit remaining length so updates larger than 4 GiB cannot wrap.
+    while (len >= 64) {
+        __builtin_memcpy(ctx->data, data, 64);
+        sha256_transform(ctx, ctx->data);
+        ctx->bitlen += 512;
+        data += 64;
+        len -= 64;
+    }
+    if (len != 0) {
+        __builtin_memcpy(ctx->data, data, len);
+        ctx->datalen = len;
     }
 }
 
@@ -148,19 +207,17 @@ void sha256_final(SHA256_CTX *ctx, SHA256_BYTE hash[]) {
 
     // Append to the padding the total message's length in bits and transform.
     ctx->bitlen += ctx->datalen * 8;
-    SHA256_DWORD *data64 = (SHA256_DWORD *)&ctx->data[56];
-    *data64 = __builtin_bswap64(ctx->bitlen);
+    SHA256_DWORD bitlen = __builtin_bswap64(ctx->bitlen);
+    __builtin_memcpy(ctx->data + 56, &bitlen, 8);
     sha256_transform(ctx, ctx->data);
 
-    const SHA256_DWORD *state64 = (const SHA256_DWORD *)ctx->state;
-    SHA256_DWORD *hash64 = (SHA256_DWORD *)hash;
+    // The digest destination has byte alignment; memcpy also allows aligned
+    // callers to retain wide stores without requiring that alignment in the API.
 #pragma GCC unroll 4
     for (i = 0; i < 4; ++i) {
-        // State stores [lo, hi] pairs, need to swap within 32-bit halves then
-        // bswap64
-        SHA256_DWORD s = state64[i];
-        // Swap the two 32-bit halves: (lo, hi) -> (hi, lo)
-        s = (s >> 32) | (s << 32);
-        hash64[i] = __builtin_bswap64(s);
+        SHA256_DWORD s;
+        __builtin_memcpy(&s, ctx->state + 2 * i, 8);
+        s = __builtin_bswap64((s >> 32) | (s << 32));
+        __builtin_memcpy(hash + 8 * i, &s, 8);
     }
 }
