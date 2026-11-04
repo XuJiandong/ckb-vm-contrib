@@ -5,6 +5,8 @@ LD = ld.lld-$(CLANG_VERSION)
 LLVM_OBJDUMP = llvm-objdump-$(CLANG_VERSION)
 LLVM_STRIP = llvm-strip-$(CLANG_VERSION)
 
+.PHONY: all run check asm fmt clean
+
 # -flto enables Link Time Optimization for better cross-module optimization (~4% cycle reduction)
 # May increase compile time and can occasionally cause issues with specific toolchain configurations
 
@@ -27,11 +29,24 @@ all: main.o sha512.o
 run:
 	ckb-debugger --bin main
 
+main.o sha512.o test_sha512.o: sha512.h
+
+test_sha512.o: test/test_sha512.c
+	$(CLANG) $(CFLAGS) -c -o $@ $<
+
+target/test_sha512: test_sha512.o sha512.o
+	mkdir -p target
+	$(LD) $(LDFLAGS) -o $@ $^
+	$(LLVM_STRIP) -s $@
+
+check: target/test_sha512
+	ckb-debugger --bin $<
+
 asm: sha512.o
 	$(LLVM_OBJDUMP) -d -S sha512.o
 
 fmt:
-	clang-format --style="{BasedOnStyle: Google, IndentWidth: 4}" -i *.c *.h
+	$(CLANG_FORMAT) --style="{BasedOnStyle: Google, IndentWidth: 4}" -i *.c *.h test/*.c
 
 clean:
-	rm -f main.o sha512.o main
+	rm -f main.o sha512.o test_sha512.o main target/test_sha512
