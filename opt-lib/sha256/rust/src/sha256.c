@@ -1,14 +1,11 @@
 /*************************** HEADER FILES ***************************/
 #include "sha256.h"
 
-// Permit paired word loads without violating the state array's effective type.
-typedef SHA256_DWORD SHA256_ALIAS __attribute__((__may_alias__));
-
 /****************************** MACROS ******************************/
 #define ROTRIGHT(a, b) (((a) >> (b)) | ((a) << (32 - (b))))
 
 #define CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
-#define MAJ(x, y, z) ((y) ^ (((x) ^ (y)) & ((y) ^ (z))))
+#define MAJ(x, y, z) ((((x) | (y)) & (z)) | ((x) & (y)))
 #define EP0(x) (ROTRIGHT(x, 2) ^ ROTRIGHT(x, 13) ^ ROTRIGHT(x, 22))
 #define EP1(x) (ROTRIGHT(x, 6) ^ ROTRIGHT(x, 11) ^ ROTRIGHT(x, 25))
 #define SIG0(x) (ROTRIGHT(x, 7) ^ ROTRIGHT(x, 18) ^ ((x) >> 3))
@@ -68,12 +65,10 @@ static inline SHA256_WORD sha256_round_constant(SHA256_WORD k) {
         (h) = sha256_add3(t1, EP0(a), MAJ(a, b, c));                     \
     } while (0)
 
-// Blocks are copied into ctx->data before compression, providing the alignment
-// needed for the 64-bit loads even when callers supply unaligned byte buffers.
 void sha256_transform(SHA256_CTX *ctx, const SHA256_BYTE data[]) {
     SHA256_WORD a, b, c, d, e, f, g, h;
     SHA256_WORD m[64];
-    const SHA256_ALIAS *data64 = (const SHA256_ALIAS *)data;
+    const SHA256_DWORD *data64 = (const SHA256_DWORD *)data;
 
 #pragma GCC unroll 8
     for (int i = 0; i < 8; ++i) {
@@ -83,7 +78,7 @@ void sha256_transform(SHA256_CTX *ctx, const SHA256_BYTE data[]) {
     }
 
     // Load state using 64-bit operations
-    const SHA256_ALIAS *state64 = (const SHA256_ALIAS *)ctx->state;
+    const SHA256_DWORD *state64 = (const SHA256_DWORD *)ctx->state;
     SHA256_DWORD s01 = state64[0];
     SHA256_DWORD s23 = state64[1];
     SHA256_DWORD s45 = state64[2];
@@ -157,35 +152,19 @@ void sha256_init(SHA256_CTX *ctx) {
 
 void sha256_update(SHA256_CTX *ctx, const SHA256_BYTE data[],
                    SHA256_DWORD len) {
-    if (len == 0) {
-        return;
-    }
-    // Complete a buffered block first, then copy whole blocks and the tail.
-    if (ctx->datalen != 0) {
-        SHA256_WORD space = 64 - ctx->datalen;
-        if (len < space) {
-            __builtin_memcpy(ctx->data + ctx->datalen, data, len);
-            ctx->datalen += len;
-            return;
+    SHA256_WORD i = 0;
+
+    while (i < len) {
+        SHA256_DWORD space = 64 - ctx->datalen;
+        SHA256_DWORD to_copy = (space < len - i) ? space : len - i;
+        __builtin_memcpy(&ctx->data[ctx->datalen], &data[i], to_copy);
+        ctx->datalen += to_copy;
+        i += to_copy;
+        if (ctx->datalen == 64) {
+            sha256_transform(ctx, ctx->data);
+            ctx->bitlen += 512;
+            ctx->datalen = 0;
         }
-        __builtin_memcpy(ctx->data + ctx->datalen, data, space);
-        sha256_transform(ctx, ctx->data);
-        ctx->bitlen += 512;
-        data += space;
-        len -= space;
-        ctx->datalen = 0;
-    }
-    // Use a 64-bit remaining length so updates larger than 4 GiB cannot wrap.
-    while (len >= 64) {
-        __builtin_memcpy(ctx->data, data, 64);
-        sha256_transform(ctx, ctx->data);
-        ctx->bitlen += 512;
-        data += 64;
-        len -= 64;
-    }
-    if (len != 0) {
-        __builtin_memcpy(ctx->data, data, len);
-        ctx->datalen = len;
     }
 }
 
@@ -207,17 +186,19 @@ void sha256_final(SHA256_CTX *ctx, SHA256_BYTE hash[]) {
 
     // Append to the padding the total message's length in bits and transform.
     ctx->bitlen += ctx->datalen * 8;
-    SHA256_DWORD bitlen = __builtin_bswap64(ctx->bitlen);
-    __builtin_memcpy(ctx->data + 56, &bitlen, 8);
+    SHA256_DWORD *data64 = (SHA256_DWORD *)&ctx->data[56];
+    *data64 = __builtin_bswap64(ctx->bitlen);
     sha256_transform(ctx, ctx->data);
 
-    // The digest destination has byte alignment; memcpy also allows aligned
-    // callers to retain wide stores without requiring that alignment in the API.
+    const SHA256_DWORD *state64 = (const SHA256_DWORD *)ctx->state;
+    SHA256_DWORD *hash64 = (SHA256_DWORD *)hash;
 #pragma GCC unroll 4
     for (i = 0; i < 4; ++i) {
-        SHA256_DWORD s;
-        __builtin_memcpy(&s, ctx->state + 2 * i, 8);
-        s = __builtin_bswap64((s >> 32) | (s << 32));
-        __builtin_memcpy(hash + 8 * i, &s, 8);
+        // State stores [lo, hi] pairs, need to swap within 32-bit halves then
+        // bswap64
+        SHA256_DWORD s = state64[i];
+        // Swap the two 32-bit halves: (lo, hi) -> (hi, lo)
+        s = (s >> 32) | (s << 32);
+        hash64[i] = __builtin_bswap64(s);
     }
 }

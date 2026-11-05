@@ -46,7 +46,7 @@ asm: sha512.o
 	$(LLVM_OBJDUMP) -d -S sha512.o
 
 fmt:
-	$(CLANG_FORMAT) --style="{BasedOnStyle: Google, IndentWidth: 4}" -i *.c *.h test/*.c
+	clang-format --style="{BasedOnStyle: Google, IndentWidth: 4}" -i *.c *.h test/*.c
 
 clean:
 	rm -f main.o sha512.o test_sha512.o main target/test_sha512

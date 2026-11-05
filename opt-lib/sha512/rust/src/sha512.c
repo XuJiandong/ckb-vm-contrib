@@ -1,14 +1,11 @@
 /*************************** HEADER FILES ***************************/
 #include "sha512.h"
 
-// Permit wide loads of the aligned byte buffer without aliasing violations.
-typedef SHA512_WORD SHA512_ALIAS __attribute__((__may_alias__));
-
 /****************************** MACROS ******************************/
 #define ROTRIGHT(a, b) (((a) >> (b)) | ((a) << (64 - (b))))
 
 #define CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
-#define MAJ(x, y, z) ((y) ^ (((x) ^ (y)) & ((y) ^ (z))))
+#define MAJ(x, y, z) ((((x) | (y)) & (z)) | ((x) & (y)))
 #define EP0(x) (ROTRIGHT(x, 28) ^ ROTRIGHT(x, 34) ^ ROTRIGHT(x, 39))
 #define EP1(x) (ROTRIGHT(x, 14) ^ ROTRIGHT(x, 18) ^ ROTRIGHT(x, 41))
 #define SIG0(x) (ROTRIGHT(x, 1) ^ ROTRIGHT(x, 8) ^ ((x) >> 7))
@@ -73,17 +70,10 @@ sha512_add3(SHA512_WORD a, SHA512_WORD b, SHA512_WORD c) {
         (h) = sha512_add3(t1, MAJ(a, b, c), EP0(a));                        \
     } while (0)
 
-// Compression always receives ctx->data, aligned for the 64-bit loads.
 void sha512_transform(SHA512_CTX *ctx, const SHA512_BYTE data[]) {
     SHA512_WORD a, b, c, d, e, f, g, h;
     SHA512_WORD m[80];
-    // Keep a shared table base instead of materializing separate addresses for
-    // all 80 constants after unrolling. This barrier emits no instructions.
-    const SHA512_WORD *round_constants = GLOBAL_K;
-#if defined(__riscv) && __riscv_xlen == 64
-    __asm__("" : "+r"(round_constants));
-#endif
-    const SHA512_ALIAS *data64 = (const SHA512_ALIAS *)data;
+    const SHA512_WORD *data64 = (const SHA512_WORD *)data;
 
 #pragma GCC unroll 16
     for (int i = 0; i < 16; ++i) {
@@ -101,41 +91,41 @@ void sha512_transform(SHA512_CTX *ctx, const SHA512_BYTE data[]) {
 
 #pragma GCC unroll 2
     for (int i = 0; i < 16; i += 8) {
-        SHA512_ROUND(a, b, c, d, e, f, g, h, m[i], round_constants[i]);
-        SHA512_ROUND(h, a, b, c, d, e, f, g, m[i + 1], round_constants[i + 1]);
-        SHA512_ROUND(g, h, a, b, c, d, e, f, m[i + 2], round_constants[i + 2]);
-        SHA512_ROUND(f, g, h, a, b, c, d, e, m[i + 3], round_constants[i + 3]);
-        SHA512_ROUND(e, f, g, h, a, b, c, d, m[i + 4], round_constants[i + 4]);
-        SHA512_ROUND(d, e, f, g, h, a, b, c, m[i + 5], round_constants[i + 5]);
-        SHA512_ROUND(c, d, e, f, g, h, a, b, m[i + 6], round_constants[i + 6]);
-        SHA512_ROUND(b, c, d, e, f, g, h, a, m[i + 7], round_constants[i + 7]);
+        SHA512_ROUND(a, b, c, d, e, f, g, h, m[i], GLOBAL_K[i]);
+        SHA512_ROUND(h, a, b, c, d, e, f, g, m[i + 1], GLOBAL_K[i + 1]);
+        SHA512_ROUND(g, h, a, b, c, d, e, f, m[i + 2], GLOBAL_K[i + 2]);
+        SHA512_ROUND(f, g, h, a, b, c, d, e, m[i + 3], GLOBAL_K[i + 3]);
+        SHA512_ROUND(e, f, g, h, a, b, c, d, m[i + 4], GLOBAL_K[i + 4]);
+        SHA512_ROUND(d, e, f, g, h, a, b, c, m[i + 5], GLOBAL_K[i + 5]);
+        SHA512_ROUND(c, d, e, f, g, h, a, b, m[i + 6], GLOBAL_K[i + 6]);
+        SHA512_ROUND(b, c, d, e, f, g, h, a, m[i + 7], GLOBAL_K[i + 7]);
     }
 
 #pragma GCC unroll 8
     for (int i = 16; i < 80; i += 8) {
         m[i] =
             sha512_add3(m[i - 16], SIG1(m[i - 2]), SIG0(m[i - 15])) + m[i - 7];
-        SHA512_ROUND(a, b, c, d, e, f, g, h, m[i], round_constants[i]);
+        SHA512_ROUND(a, b, c, d, e, f, g, h, m[i], GLOBAL_K[i]);
         m[i + 1] =
             sha512_add3(m[i - 15], SIG1(m[i - 1]), SIG0(m[i - 14])) + m[i - 6];
-        SHA512_ROUND(h, a, b, c, d, e, f, g, m[i + 1], round_constants[i + 1]);
+        SHA512_ROUND(h, a, b, c, d, e, f, g, m[i + 1], GLOBAL_K[i + 1]);
         m[i + 2] =
             sha512_add3(m[i - 14], SIG1(m[i]), SIG0(m[i - 13])) + m[i - 5];
-        SHA512_ROUND(g, h, a, b, c, d, e, f, m[i + 2], round_constants[i + 2]);
+        SHA512_ROUND(g, h, a, b, c, d, e, f, m[i + 2], GLOBAL_K[i + 2]);
         m[i + 3] =
             sha512_add3(m[i - 13], SIG1(m[i + 1]), SIG0(m[i - 12])) + m[i - 4];
-        SHA512_ROUND(f, g, h, a, b, c, d, e, m[i + 3], round_constants[i + 3]);
+        SHA512_ROUND(f, g, h, a, b, c, d, e, m[i + 3], GLOBAL_K[i + 3]);
         m[i + 4] =
             sha512_add3(m[i - 12], SIG1(m[i + 2]), SIG0(m[i - 11])) + m[i - 3];
-        SHA512_ROUND(e, f, g, h, a, b, c, d, m[i + 4], round_constants[i + 4]);
+        SHA512_ROUND(e, f, g, h, a, b, c, d, m[i + 4], GLOBAL_K[i + 4]);
         m[i + 5] =
             sha512_add3(m[i - 11], SIG1(m[i + 3]), SIG0(m[i - 10])) + m[i - 2];
-        SHA512_ROUND(d, e, f, g, h, a, b, c, m[i + 5], round_constants[i + 5]);
+        SHA512_ROUND(d, e, f, g, h, a, b, c, m[i + 5], GLOBAL_K[i + 5]);
         m[i + 6] =
             sha512_add3(m[i - 10], SIG1(m[i + 4]), SIG0(m[i - 9])) + m[i - 1];
-        SHA512_ROUND(c, d, e, f, g, h, a, b, m[i + 6], round_constants[i + 6]);
+        SHA512_ROUND(c, d, e, f, g, h, a, b, m[i + 6], GLOBAL_K[i + 6]);
         m[i + 7] = sha512_add3(m[i - 9], SIG1(m[i + 5]), SIG0(m[i - 8])) + m[i];
-        SHA512_ROUND(b, c, d, e, f, g, h, a, m[i + 7], round_constants[i + 7]);
+        SHA512_ROUND(b, c, d, e, f, g, h, a, m[i + 7], GLOBAL_K[i + 7]);
     }
 
     ctx->state[0] += a;
@@ -159,34 +149,19 @@ void sha512_init(SHA512_CTX *ctx) {
 }
 
 void sha512_update(SHA512_CTX *ctx, const SHA512_BYTE data[], SHA512_WORD len) {
-    if (len == 0) {
-        return;
-    }
-    // Complete a buffered block first, then copy full blocks and the tail.
-    if (ctx->datalen != 0) {
+    SHA512_WORD i = 0;
+
+    while (i < len) {
         SHA512_WORD space = 128 - ctx->datalen;
-        if (len < space) {
-            __builtin_memcpy(ctx->data + ctx->datalen, data, len);
-            ctx->datalen += len;
-            return;
+        SHA512_WORD to_copy = (space < len - i) ? space : len - i;
+        __builtin_memcpy(&ctx->data[ctx->datalen], &data[i], to_copy);
+        ctx->datalen += to_copy;
+        i += to_copy;
+        if (ctx->datalen == 128) {
+            sha512_transform(ctx, ctx->data);
+            ctx->bitlen += 1024;
+            ctx->datalen = 0;
         }
-        __builtin_memcpy(ctx->data + ctx->datalen, data, space);
-        sha512_transform(ctx, ctx->data);
-        ctx->bitlen += 1024;
-        data += space;
-        len -= space;
-        ctx->datalen = 0;
-    }
-    while (len >= 128) {
-        __builtin_memcpy(ctx->data, data, 128);
-        sha512_transform(ctx, ctx->data);
-        ctx->bitlen += 1024;
-        data += 128;
-        len -= 128;
-    }
-    if (len != 0) {
-        __builtin_memcpy(ctx->data, data, len);
-        ctx->datalen = len;
     }
 }
 
@@ -208,16 +183,16 @@ void sha512_final(SHA512_CTX *ctx, SHA512_BYTE hash[]) {
 
     // Append to the padding the total message's length in bits and transform.
     ctx->bitlen += ctx->datalen * 8;
+    SHA512_DWORD *data128 = (SHA512_DWORD *)&ctx->data[112];
     SHA512_DWORD bitlen_be =
         ((SHA512_DWORD)__builtin_bswap64((SHA512_WORD)ctx->bitlen) << 64) |
         (SHA512_DWORD)__builtin_bswap64((SHA512_WORD)(ctx->bitlen >> 64));
-    __builtin_memcpy(ctx->data + 112, &bitlen_be, 16);
+    *data128 = bitlen_be;
     sha512_transform(ctx, ctx->data);
 
-    // The byte-buffer API permits unaligned digest destinations.
+    SHA512_WORD *hash64 = (SHA512_WORD *)hash;
 #pragma GCC unroll 8
     for (i = 0; i < 8; ++i) {
-        SHA512_WORD s = __builtin_bswap64(ctx->state[i]);
-        __builtin_memcpy(hash + 8 * i, &s, 8);
+        hash64[i] = __builtin_bswap64(ctx->state[i]);
     }
 }
