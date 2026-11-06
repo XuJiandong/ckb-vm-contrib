@@ -29,19 +29,44 @@ static FIPS202_UINT64 load64(const FIPS202_UINT8* x) {
 #endif
 }
 
-/*************************************************
- * Name:        store64
- *
- * Description: Store a 64-bit integer to a byte array in little-endian order
- *
- * Arguments:   - FIPS202_UINT8 *x: pointer to the output byte array
- *              - FIPS202_UINT64 u: input 64-bit unsigned integer
- **************************************************/
-static void store64(FIPS202_UINT8* x, FIPS202_UINT64 u) {
-#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-    u = __builtin_bswap64(u);
+// Absorb full lanes instead of repeating byte loads, shifts, and state writes.
+// load64 uses memcpy, so the input still only needs byte alignment.
+static void keccak_xor_bytes(FIPS202_UINT64* s, FIPS202_SIZE_T pos,
+                             const FIPS202_UINT8* input, FIPS202_SIZE_T len) {
+    while ((pos & 7) && len) {
+        s[pos >> 3] ^= (FIPS202_UINT64)*input++ << (8 * (pos & 7));
+        ++pos;
+        --len;
+    }
+    FIPS202_UINT64* lane = s + (pos >> 3);
+    while (len >= 8) {
+        *lane++ ^= load64(input);
+        input += 8;
+        pos += 8;
+        len -= 8;
+    }
+    while (len) {
+        s[pos >> 3] ^= (FIPS202_UINT64)*input++ << (8 * (pos & 7));
+        ++pos;
+        --len;
+    }
+}
+
+// State lanes are already little-endian on CKB-VM. Copy only the requested
+// bytes, retaining byte-aligned output and a portable big-endian fallback.
+static void keccak_extract_bytes(FIPS202_UINT8* output, const FIPS202_UINT64* s,
+                                 FIPS202_SIZE_T pos, FIPS202_SIZE_T len) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    if (len) __builtin_memmove(output, (const FIPS202_UINT8*)s + pos, len);
+#else
+    // Every extraction fits within the 200-byte state. Stage it before writing
+    // so SHA3 finalization also permits output overlapping the exposed state.
+    FIPS202_UINT8 bytes[200];
+    for (FIPS202_SIZE_T i = 0; i < len; ++i) {
+        bytes[i] = s[(pos + i) >> 3] >> (8 * ((pos + i) & 7));
+    }
+    if (len) __builtin_memcpy(output, bytes, len);
 #endif
-    __builtin_memcpy(x, &u, 8);
 }
 
 /* Keccak round constants */
@@ -337,30 +362,18 @@ static void KeccakF1600_StatePermute(FIPS202_UINT64* state) {
 static void keccak_absorb(FIPS202_UINT64* s, FIPS202_UINT32 r,
                           const FIPS202_UINT8* m, FIPS202_SIZE_T mlen,
                           FIPS202_UINT8 p) {
-    FIPS202_SIZE_T i;
-    FIPS202_UINT8 t[200];
-
-    /* Zero state */
     __builtin_memset(s, 0, 25 * sizeof(FIPS202_UINT64));
-
     while (mlen >= r) {
-        for (i = 0; i < r / 8; ++i) {
-            s[i] ^= load64(m + 8 * i);
-        }
-
+        keccak_xor_bytes(s, 0, m, r);
         KeccakF1600_StatePermute(s);
         mlen -= r;
         m += r;
     }
-
-    __builtin_memset(t, 0, r);
-    __builtin_memcpy(t, m, mlen);
-    t[mlen] = p;
-
-    t[r - 1] |= 128;
-    for (i = 0; i < r / 8; ++i) {
-        s[i] ^= load64(t + 8 * i);
-    }
+    // Apply the final bytes and domain padding directly to the state, avoiding
+    // a padded temporary block and XORs over its zero-filled tail.
+    keccak_xor_bytes(s, 0, m, mlen);
+    s[mlen >> 3] ^= (FIPS202_UINT64)p << (8 * (mlen & 7));
+    s[(r - 1) >> 3] ^= (FIPS202_UINT64)1 << 63;
 }
 
 /*************************************************
@@ -380,10 +393,7 @@ static void keccak_squeezeblocks(FIPS202_UINT8* h, FIPS202_SIZE_T nblocks,
                                  FIPS202_UINT64* s, FIPS202_UINT32 r) {
     while (nblocks > 0) {
         KeccakF1600_StatePermute(s);
-#pragma GCC unroll 21
-        for (FIPS202_SIZE_T i = 0; i < (r >> 3); i++) {
-            store64(h + 8 * i, s[i]);
-        }
+        keccak_extract_bytes(h, s, 0, r);
         h += r;
         nblocks--;
     }
@@ -419,28 +429,21 @@ static void keccak_inc_init(FIPS202_UINT64* s_inc) {
  **************************************************/
 static void keccak_inc_absorb(FIPS202_UINT64* s_inc, FIPS202_UINT32 r,
                               const FIPS202_UINT8* m, FIPS202_SIZE_T mlen) {
-    FIPS202_SIZE_T i;
-
-    /* Recall that s_inc[25] is the non-absorbed bytes xored into the state */
-    while (mlen + s_inc[25] >= r) {
-        for (i = 0; i < r - s_inc[25]; i++) {
-            /* Take the i'th byte from message
-               xor with the s_inc[25] + i'th byte of the state; little-endian */
-            s_inc[(s_inc[25] + i) >> 3] ^= (FIPS202_UINT64)m[i]
-                                           << (8 * ((s_inc[25] + i) & 0x07));
+    FIPS202_SIZE_T pos = s_inc[25];
+    // Bound each update by the remaining rate space without adding to mlen.
+    while (mlen) {
+        FIPS202_SIZE_T take = r - pos;
+        if (take > mlen) take = mlen;
+        keccak_xor_bytes(s_inc, pos, m, take);
+        pos += take;
+        m += take;
+        mlen -= take;
+        if (pos == r) {
+            KeccakF1600_StatePermute(s_inc);
+            pos = 0;
         }
-        mlen -= (FIPS202_SIZE_T)(r - s_inc[25]);
-        m += r - s_inc[25];
-        s_inc[25] = 0;
-
-        KeccakF1600_StatePermute(s_inc);
     }
-
-    for (i = 0; i < mlen; i++) {
-        s_inc[(s_inc[25] + i) >> 3] ^= (FIPS202_UINT64)m[i]
-                                       << (8 * ((s_inc[25] + i) & 0x07));
-    }
-    s_inc[25] += mlen;
+    s_inc[25] = pos;
 }
 
 /*************************************************
@@ -480,29 +483,17 @@ static void keccak_inc_finalize(FIPS202_UINT64* s_inc, FIPS202_UINT32 r,
  **************************************************/
 static void keccak_inc_squeeze(FIPS202_UINT8* h, FIPS202_SIZE_T outlen,
                                FIPS202_UINT64* s_inc, FIPS202_UINT32 r) {
-    FIPS202_SIZE_T i;
-
-    /* First consume any bytes we still have sitting around */
-    for (i = 0; i < outlen && i < s_inc[25]; i++) {
-        /* There are s_inc[25] bytes left, so r - s_inc[25] is the first
-           available byte. We consume from there, i.e., up to r. */
-        h[i] = (FIPS202_UINT8)(s_inc[(r - s_inc[25] + i) >> 3] >>
-                               (8 * ((r - s_inc[25] + i) & 0x07)));
-    }
-    h += i;
-    outlen -= i;
-    s_inc[25] -= i;
-
-    /* Then squeeze the remaining necessary blocks */
-    while (outlen > 0) {
-        KeccakF1600_StatePermute(s_inc);
-
-        for (i = 0; i < outlen && i < r; i++) {
-            h[i] = (FIPS202_UINT8)(s_inc[i >> 3] >> (8 * (i & 0x07)));
+    while (outlen) {
+        if (s_inc[25] == 0) {
+            KeccakF1600_StatePermute(s_inc);
+            s_inc[25] = r;
         }
-        h += i;
-        outlen -= i;
-        s_inc[25] = r - i;
+        FIPS202_SIZE_T take = s_inc[25];
+        if (take > outlen) take = outlen;
+        keccak_extract_bytes(h, s_inc, r - s_inc[25], take);
+        h += take;
+        outlen -= take;
+        s_inc[25] -= take;
     }
 }
 
@@ -569,7 +560,6 @@ void shake128_squeezeblocks(FIPS202_UINT8* output, FIPS202_SIZE_T nblocks,
 void shake128(FIPS202_UINT8* output, FIPS202_SIZE_T outlen,
               const FIPS202_UINT8* input, FIPS202_SIZE_T inlen) {
     FIPS202_SIZE_T nblocks = outlen / SHAKE128_RATE;
-    FIPS202_UINT8 t[SHAKE128_RATE];
     FIPS202_UINT64 s[25];
 
     shake128_absorb(s, input, inlen);
@@ -579,8 +569,8 @@ void shake128(FIPS202_UINT8* output, FIPS202_SIZE_T outlen,
     outlen -= nblocks * SHAKE128_RATE;
 
     if (outlen) {
-        shake128_squeezeblocks(t, 1, s);
-        __builtin_memcpy(output, t, outlen);
+        KeccakF1600_StatePermute(s);
+        keccak_extract_bytes(output, s, 0, outlen);
     }
 }
 
@@ -647,7 +637,6 @@ void shake256_squeezeblocks(FIPS202_UINT8* output, FIPS202_SIZE_T nblocks,
 void shake256(FIPS202_UINT8* output, FIPS202_SIZE_T outlen,
               const FIPS202_UINT8* input, FIPS202_SIZE_T inlen) {
     FIPS202_SIZE_T nblocks = outlen / SHAKE256_RATE;
-    FIPS202_UINT8 t[SHAKE256_RATE];
     FIPS202_UINT64 s[25];
 
     shake256_absorb(s, input, inlen);
@@ -657,8 +646,8 @@ void shake256(FIPS202_UINT8* output, FIPS202_SIZE_T outlen,
     outlen -= nblocks * SHAKE256_RATE;
 
     if (outlen) {
-        shake256_squeezeblocks(t, 1, s);
-        __builtin_memcpy(output, t, outlen);
+        KeccakF1600_StatePermute(s);
+        keccak_extract_bytes(output, s, 0, outlen);
     }
 }
 
@@ -670,13 +659,9 @@ void sha3_256_inc_absorb(FIPS202_UINT64* s_inc, const FIPS202_UINT8* input,
 }
 
 void sha3_256_inc_finalize(FIPS202_UINT8* output, FIPS202_UINT64* s_inc) {
-    FIPS202_UINT8 t[SHA3_256_RATE];
     keccak_inc_finalize(s_inc, SHA3_256_RATE, 0x06);
     KeccakF1600_StatePermute(s_inc);
-    for (FIPS202_SIZE_T i = 0; i < 32; i++) {
-        t[i] = (FIPS202_UINT8)(s_inc[i >> 3] >> (8 * (i & 0x07)));
-    }
-    __builtin_memcpy(output, t, 32);
+    keccak_extract_bytes(output, s_inc, 0, 32);
 }
 
 /*************************************************
@@ -691,14 +676,10 @@ void sha3_256_inc_finalize(FIPS202_UINT8* output, FIPS202_UINT64* s_inc) {
 void sha3_256(FIPS202_UINT8* output, const FIPS202_UINT8* input,
               FIPS202_SIZE_T inlen) {
     FIPS202_UINT64 s[25];
-    FIPS202_UINT8 t[SHA3_256_RATE];
 
     keccak_absorb(s, SHA3_256_RATE, input, inlen, 0x06);
     KeccakF1600_StatePermute(s);
-    for (FIPS202_SIZE_T i = 0; i < 32; i++) {
-        t[i] = (FIPS202_UINT8)(s[i >> 3] >> (8 * (i & 0x07)));
-    }
-    __builtin_memcpy(output, t, 32);
+    keccak_extract_bytes(output, s, 0, 32);
 }
 
 void sha3_512_inc_init(FIPS202_UINT64* s_inc) { keccak_inc_init(s_inc); }
@@ -709,13 +690,9 @@ void sha3_512_inc_absorb(FIPS202_UINT64* s_inc, const FIPS202_UINT8* input,
 }
 
 void sha3_512_inc_finalize(FIPS202_UINT8* output, FIPS202_UINT64* s_inc) {
-    FIPS202_UINT8 t[SHA3_512_RATE];
     keccak_inc_finalize(s_inc, SHA3_512_RATE, 0x06);
     KeccakF1600_StatePermute(s_inc);
-    for (FIPS202_SIZE_T i = 0; i < 64; i++) {
-        t[i] = (FIPS202_UINT8)(s_inc[i >> 3] >> (8 * (i & 0x07)));
-    }
-    __builtin_memcpy(output, t, 64);
+    keccak_extract_bytes(output, s_inc, 0, 64);
 }
 
 /*************************************************
@@ -730,12 +707,8 @@ void sha3_512_inc_finalize(FIPS202_UINT8* output, FIPS202_UINT64* s_inc) {
 void sha3_512(FIPS202_UINT8* output, const FIPS202_UINT8* input,
               FIPS202_SIZE_T inlen) {
     FIPS202_UINT64 s[25];
-    FIPS202_UINT8 t[SHA3_512_RATE];
 
     keccak_absorb(s, SHA3_512_RATE, input, inlen, 0x06);
     KeccakF1600_StatePermute(s);
-    for (FIPS202_SIZE_T i = 0; i < 64; i++) {
-        t[i] = (FIPS202_UINT8)(s[i >> 3] >> (8 * (i & 0x07)));
-    }
-    __builtin_memcpy(output, t, 64);
+    keccak_extract_bytes(output, s, 0, 64);
 }

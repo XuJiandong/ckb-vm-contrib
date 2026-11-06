@@ -5,6 +5,8 @@ LD = ld.lld-$(CLANG_VERSION)
 LLVM_OBJDUMP = llvm-objdump-$(CLANG_VERSION)
 LLVM_STRIP = llvm-strip-$(CLANG_VERSION)
 
+.PHONY: all run check asm fmt clean
+
 # -flto enables Link Time Optimization for better cross-module optimization (~4% cycle reduction)
 # May increase compile time and can occasionally cause issues with specific toolchain configurations
 
@@ -27,11 +29,24 @@ all: main.o fips202.o
 run:
 	ckb-debugger --bin main
 
+main.o fips202.o test_fips202.o: fips202.h
+
+test_fips202.o: test/test_fips202.c
+	$(CLANG) $(CFLAGS) -c -o $@ $<
+
+target/test_fips202: test_fips202.o fips202.o
+	mkdir -p target
+	$(LD) $(LDFLAGS) -o $@ $^
+	$(LLVM_STRIP) -s $@
+
+check: target/test_fips202
+	ckb-debugger --bin $<
+
 asm: fips202.o
 	$(LLVM_OBJDUMP) -d -S fips202.o
 
 fmt:
-	$(CLANG_FORMAT) --style="{BasedOnStyle: Google, IndentWidth: 4}" -i *.c *.h
+	$(CLANG_FORMAT) --style="{BasedOnStyle: Google, IndentWidth: 4}" -i *.c *.h test/*.c
 
 clean:
-	rm -f main.o fips202.o main
+	rm -f main.o fips202.o test_fips202.o main target/test_fips202
