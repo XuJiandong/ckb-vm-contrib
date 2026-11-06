@@ -42,12 +42,32 @@ static const SHA512_WORD GLOBAL_K[80] = {
     0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL};
 
 /*********************** FUNCTION DEFINITIONS ***********************/
-#define SHA512_ROUND(a, b, c, d, e, f, g, h, ki, mi)               \
-    do {                                                           \
-        SHA512_WORD t1 = (h) + EP1(e) + CH(e, f, g) + (ki) + (mi); \
-        SHA512_WORD t2 = EP0(a) + MAJ(a, b, c);                    \
-        (d) += t1;                                                 \
-        (h) = t1 + t2;                                             \
+// RFC 0033: CKB-VM fuses this exact add/sltu/add/sltu/or sequence into
+// one ADC (one cycle). Only the sum modulo 2^64 is needed; carry outputs are
+// discarded. Early-clobber constraints keep all three registers distinct.
+// Keep the sequence together so the compiler cannot reorder or remove it.
+static inline __attribute__((always_inline)) SHA512_WORD
+sha512_add3(SHA512_WORD a, SHA512_WORD b, SHA512_WORD c) {
+#if defined(__riscv) && __riscv_xlen == 64
+    __asm__(
+        "add %0, %0, %1\n\t"
+        "sltu %1, %0, %1\n\t"
+        "add %0, %0, %2\n\t"
+        "sltu %2, %0, %2\n\t"
+        "or %1, %1, %2"
+        : "+&r"(a), "+&r"(b), "+&r"(c));
+    return a;
+#else
+    return a + b + c;
+#endif
+}
+
+#define SHA512_ROUND(a, b, c, d, e, f, g, h, mi, ki)                        \
+    do {                                                                    \
+        SHA512_WORD t1 =                                                    \
+            sha512_add3(sha512_add3((h), EP1(e), (ki)), (mi), CH(e, f, g)); \
+        (d) += t1;                                                          \
+        (h) = sha512_add3(t1, MAJ(a, b, c), EP0(a));                        \
     } while (0)
 
 void sha512_transform(SHA512_CTX *ctx, const SHA512_BYTE data[]) {
@@ -83,21 +103,28 @@ void sha512_transform(SHA512_CTX *ctx, const SHA512_BYTE data[]) {
 
 #pragma GCC unroll 8
     for (int i = 16; i < 80; i += 8) {
-        m[i] = SIG1(m[i - 2]) + m[i - 7] + SIG0(m[i - 15]) + m[i - 16];
+        m[i] =
+            sha512_add3(m[i - 16], SIG1(m[i - 2]), SIG0(m[i - 15])) + m[i - 7];
         SHA512_ROUND(a, b, c, d, e, f, g, h, m[i], GLOBAL_K[i]);
-        m[i + 1] = SIG1(m[i - 1]) + m[i - 6] + SIG0(m[i - 14]) + m[i - 15];
+        m[i + 1] =
+            sha512_add3(m[i - 15], SIG1(m[i - 1]), SIG0(m[i - 14])) + m[i - 6];
         SHA512_ROUND(h, a, b, c, d, e, f, g, m[i + 1], GLOBAL_K[i + 1]);
-        m[i + 2] = SIG1(m[i]) + m[i - 5] + SIG0(m[i - 13]) + m[i - 14];
+        m[i + 2] =
+            sha512_add3(m[i - 14], SIG1(m[i]), SIG0(m[i - 13])) + m[i - 5];
         SHA512_ROUND(g, h, a, b, c, d, e, f, m[i + 2], GLOBAL_K[i + 2]);
-        m[i + 3] = SIG1(m[i + 1]) + m[i - 4] + SIG0(m[i - 12]) + m[i - 13];
+        m[i + 3] =
+            sha512_add3(m[i - 13], SIG1(m[i + 1]), SIG0(m[i - 12])) + m[i - 4];
         SHA512_ROUND(f, g, h, a, b, c, d, e, m[i + 3], GLOBAL_K[i + 3]);
-        m[i + 4] = SIG1(m[i + 2]) + m[i - 3] + SIG0(m[i - 11]) + m[i - 12];
+        m[i + 4] =
+            sha512_add3(m[i - 12], SIG1(m[i + 2]), SIG0(m[i - 11])) + m[i - 3];
         SHA512_ROUND(e, f, g, h, a, b, c, d, m[i + 4], GLOBAL_K[i + 4]);
-        m[i + 5] = SIG1(m[i + 3]) + m[i - 2] + SIG0(m[i - 10]) + m[i - 11];
+        m[i + 5] =
+            sha512_add3(m[i - 11], SIG1(m[i + 3]), SIG0(m[i - 10])) + m[i - 2];
         SHA512_ROUND(d, e, f, g, h, a, b, c, m[i + 5], GLOBAL_K[i + 5]);
-        m[i + 6] = SIG1(m[i + 4]) + m[i - 1] + SIG0(m[i - 9]) + m[i - 10];
+        m[i + 6] =
+            sha512_add3(m[i - 10], SIG1(m[i + 4]), SIG0(m[i - 9])) + m[i - 1];
         SHA512_ROUND(c, d, e, f, g, h, a, b, m[i + 6], GLOBAL_K[i + 6]);
-        m[i + 7] = SIG1(m[i + 5]) + m[i] + SIG0(m[i - 8]) + m[i - 9];
+        m[i + 7] = sha512_add3(m[i - 9], SIG1(m[i + 5]), SIG0(m[i - 8])) + m[i];
         SHA512_ROUND(b, c, d, e, f, g, h, a, m[i + 7], GLOBAL_K[i + 7]);
     }
 
